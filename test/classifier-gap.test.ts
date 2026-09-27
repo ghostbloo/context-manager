@@ -14,10 +14,13 @@ class Probe extends AutobiographicalStrategy {
   entries() { return this.summaries; }
   seed(s: SummaryEntry) { this.pushSummary(s); }
   cap() { return this.isAtSpeculativeCap(); }
-  candidates(entries: SummaryEntry[]) { return this.contiguousMergeCandidates(entries, 2); }
+  candidates(entries: SummaryEntry[], threshold = 2) { return this.contiguousMergeCandidates(entries, threshold); }
   setChunks(chunks: Chunk[]) { this.chunks = chunks; }
   queue(ids: string[]) { this.enqueueMerge({ level: 2, sourceIds: ids }); }
   queued() { return this.mergeQueue.length; }
+  pop() { return this.dequeueMerge(); }
+  sanitize(store: StrategyContext['messageStore']) { return this.sanitizePersistedMergeQueue(store); }
+  merge(level: number, ids: string[], ctx: StrategyContext) { return this.executeMerge(level, ids, ctx); }
 }
 const context = (manager: ContextManager) => (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 async function fixture(options: Partial<AutobiographicalConfig> = {}, replies = ['cyber']) {
@@ -116,26 +119,89 @@ for (const [positionedRecallPairs, adaptiveResolution] of [[true, false], [false
   });
 }
 
-it('gap excludes speculative debt and breaks merge topology', async () => {
-  const f = await fixture();
+it('gap stays visible while ordinary neighbours merge across it without stalling the cap', async () => {
+  const f = await fixture({
+    maxSpeculativeL1s: 0,
+    recallEnvelope: 'xml',
+    compressionMergeSourceOnly: true,
+  }, ['cyber', 'success']);
   await f.strategy.run(f.chunk(2, 4), context(f.manager));
-  const gap = f.strategy.entries()[0];
-  assert.equal(f.strategy.cap(), false);
+  const gap = f.strategy.entries()[0]!;
+  assert.equal(f.strategy.cap(), false, 'gap is resting coverage, not speculative debt');
   const regular = (id: string, start: number, end: number): SummaryEntry => ({
-    id, level: 1, sourceLevel: 0, content: 'memory', tokens: 5, created: 1,
+    id, level: 1, sourceLevel: 0, content: `memory ${id}`, tokens: 5, created: 1,
     sourceIds: f.all.slice(start, end).map(m => m.id),
-    sourceRange: { first: f.all[start].id, last: f.all[end - 1].id },
+    sourceRange: { first: f.all[start]!.id, last: f.all[end - 1]!.id },
   });
   const left = regular('left', 0, 2), right = regular('right', 4, 6);
   f.strategy.setChunks([f.chunk(0, 6)]);
-  assert.equal(f.strategy.candidates([left, gap, right]), null);
   f.strategy.seed(left);
   f.strategy.seed(right);
+  assert.deepEqual(
+    f.strategy.candidates([left, gap, right])?.map(summary => summary.id),
+    ['left', 'right'],
+    'a fully gap-covered hole does not strand ordinary neighbours',
+  );
+  assert.equal(f.strategy.candidates([gap]), null, 'all-gap windows never merge');
+  assert.equal(f.strategy.cap(), true, 'ordinary unmerged L1s still consume the cap');
   f.strategy.queue([left.id, right.id]);
-  f.strategy.queue([left.id, gap.id]);
-  assert.equal(f.strategy.queued(), 0, 'explicit merges cannot include or span the gap');
-  assert.equal(f.strategy.cap(), true, 'ordinary L1 still consumes speculative capacity');
-  assert.deepEqual(f.strategy.candidates([regular('a', 0, 1), regular('b', 1, 2), gap, right])?.map(s => s.id), ['a', 'b']);
+  f.strategy.sanitize(context(f.manager).messageStore);
+  assert.equal(f.strategy.queued(), 1, 'persisted merge intent survives a documented gap hole');
+  f.strategy.pop();
+
+  await f.strategy.merge(2, [left.id, right.id], context(f.manager));
+  const request = f.requests.at(-1)!;
+  const renderedGap = request.messages.filter(message =>
+    message.content.some(block => block.type === 'text' && block.text.includes('classifier-refused: cyber')),
+  );
+  assert.equal(renderedGap.length, 1, 'merge target carries one fixed gap record');
+  assert.equal(renderedGap[0]!.participant, 'Context Manager');
+  assert.ok(!renderedGap[0]!.content.some(block => block.type === 'text' && block.text.includes('<memory')),
+    'gap record is never wrapped in a resident memory envelope');
+  assert.ok(request.messages.some(message => message.content.some(block =>
+    block.type === 'text' && block.text.includes('Do not infer, reconstruct, or smooth over'),
+  )), 'merge instruction preserves the unknown span');
+
+  const parent = f.strategy.entries().find(summary => summary.level === 2)!;
+  assert.deepEqual(parent.sourceIds, ['left', 'right'], 'gap remains a record, not autobiographical source');
+  assert.equal(gap.mergedInto, undefined, 'gap remains independently visible after merge');
+  assert.equal(left.mergedInto, parent.id);
+  assert.equal(right.mergedInto, parent.id);
+  assert.equal(f.strategy.cap(), false, 'merged neighbours no longer stall L1 production');
+
+  const live = await f.manager.compile({ maxTokens: 200_000, reserveForResponse: 0 });
+  const liveGap = live.messages.filter(message =>
+    message.content.some(block => block.type === 'text' && block.text.includes('classifier-refused: cyber')),
+  );
+  assert.ok(liveGap.length > 0, 'fixed gap record survives beside the merged parent');
+  assert.ok(liveGap.every(message => message.participant === 'Context Manager'));
+  assert.ok(liveGap.every(message => !message.content.some(block => block.type === 'text' && block.text.includes('<memory'))));
+});
+
+it('an unindexed gap does not globally block an unrelated merge queue', async () => {
+  const f = await fixture();
+  const regular = (id: string, start: number, end: number): SummaryEntry => ({
+    id, level: 1, sourceLevel: 0, content: `memory ${id}`, tokens: 5, created: 1,
+    sourceIds: f.all.slice(start, end).map(message => message.id),
+    sourceRange: { first: f.all[start]!.id, last: f.all[end - 1]!.id },
+  });
+  const left = regular('left-unrelated', 0, 1), right = regular('right-unrelated', 1, 2);
+  f.strategy.setChunks([f.chunk(0, 2)]);
+  f.strategy.seed(left);
+  f.strategy.seed(right);
+  f.strategy.seed({
+    id: 'unindexed-gap', level: 1, sourceLevel: 0,
+    content: '[Context Manager record: gap]', tokens: 5, created: 1,
+    sourceIds: ['missing-a', 'missing-b'], sourceRange: { first: 'missing-a', last: 'missing-b' },
+    classifierGap: {
+      kind: 'classifier-gap', category: 'cyber', sourceHash: 'hash',
+      sourceRange: { first: 'missing-a', last: 'missing-b' }, canonicalRequestHash: 'request',
+      requestHashes: ['request'], attempts: [{ requestHash: 'request', stopReason: 'refusal', category: 'cyber' }],
+      quarantineKey: 'gap-key', provisional: true, revisitable: true,
+    },
+  });
+  f.strategy.queue([left.id, right.id]);
+  assert.equal(f.strategy.queued(), 1);
 });
 
 it('documents unresolved supersession: clearing quarantine does not bypass exact-L1 adoption', async () => {

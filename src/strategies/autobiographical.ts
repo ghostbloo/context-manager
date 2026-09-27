@@ -3642,26 +3642,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * otherwise re-discover the same unmerged run and re-enqueue it forever.
    * The merge-quarantine klaxon owns visibility; this guard stays silent.
    */
-  /** Gaps are topology boundaries even for explicit or persisted merge requests. */
-  private mergeCrossesClassifierGap(sourceIds: string[]): boolean {
-    const gaps = this.summaries.filter(s => s.classifierGap);
-    if (gaps.length === 0) return false;
-    const sources = this.summaries.filter(s => sourceIds.includes(s.id));
-    if (sources.some(s => s.classifierGap)) return true;
+  /** Active classifier gaps whose exact source range intersects this merge span.
+   * Unresolved positions do not globally poison unrelated merges; a gap is
+   * included only when both the merge and gap span are locatable. */
+  private classifierGapsWithinMergeSpan(sources: SummaryEntry[]): SummaryEntry[] {
+    if (sources.length === 0) return [];
     const positions = new Map(this.chunks.flatMap(c => c.messages).map((m, i) => [m.id, i]));
-    const endpoints = sources.flatMap(s => [positions.get(s.sourceRange.first), positions.get(s.sourceRange.last)]);
-    // With gaps present, unresolved positions cannot establish a safe merge span.
-    if (endpoints.some(p => p === undefined)) return true;
-    const lo = Math.min(...endpoints as number[]), hi = Math.max(...endpoints as number[]);
-    return gaps.some(gap => {
-      const first = positions.get(gap.sourceRange.first), last = positions.get(gap.sourceRange.last);
-      return first === undefined || last === undefined || (first <= hi && last >= lo);
+    const endpoints = sources.flatMap(s => [
+      positions.get(s.sourceRange.first),
+      positions.get(s.sourceRange.last),
+    ]);
+    if (endpoints.some(position => position === undefined)) return [];
+    const lo = Math.min(...endpoints as number[]);
+    const hi = Math.max(...endpoints as number[]);
+    return this.summaries.filter((gap) => {
+      if (!gap.classifierGap || gap.mergedInto) return false;
+      const first = positions.get(gap.sourceRange.first);
+      const last = positions.get(gap.sourceRange.last);
+      return first !== undefined && last !== undefined && first <= hi && last >= lo;
     });
   }
 
   protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
-    if (this.mergeCrossesClassifierGap(merge.sourceIds)) return;
     if (this.mergeQuarantine.has(sha256Json(merge.sourceIds))) return;
     this.mergeQueue.push(merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
@@ -3686,6 +3689,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.mergeQueue.length === 0) return;
     const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
+    const gapRanges = this.summaries
+      .filter((summary) => summary.classifierGap && !summary.mergedInto)
+      .flatMap((gap) => {
+        const first = position.get(gap.sourceRange.first);
+        const last = position.get(gap.sourceRange.last);
+        return first === undefined || last === undefined
+          ? []
+          : [{ first: Math.min(first, last), last: Math.max(first, last) }];
+      })
+      .sort((a, b) => a.first - b.first);
+    const holeCoveredByGaps = (first: number, last: number): boolean => {
+      let cursor = first;
+      for (const gap of gapRanges) {
+        if (gap.last < cursor) continue;
+        if (gap.first > cursor) return false;
+        cursor = Math.max(cursor, gap.last + 1);
+        if (cursor > last) return true;
+      }
+      return cursor > last;
+    };
     const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
       if (merge.sourceIds.length < 2) return false;
       let previousEnd: number | null = null;
@@ -3699,7 +3722,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const first = position.get(source.sourceRange.first);
         const last = position.get(source.sourceRange.last);
         if (first === undefined || last === undefined || last < first) return false;
-        if (previousEnd !== null && first !== previousEnd + 1) return false;
+        if (previousEnd !== null && first !== previousEnd + 1) {
+          if (first <= previousEnd + 1 || !holeCoveredByGaps(previousEnd + 1, first - 1)) return false;
+        }
         previousEnd = last;
       }
       return true;
@@ -4483,7 +4508,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         mergeQuarantineCount,
         compressionQuarantineCount,
         unmergedFrontier: {
-          l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto).length,
+          l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto && !s.classifierGap).length,
           l2: this.summaries.filter((s) => s.level === 2 && !s.mergedInto).length,
           l3: this.summaries.filter((s) => s.level === 3 && !s.mergedInto).length,
         },
@@ -6175,7 +6200,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const canonicalCategory = canonicalPhysical[0]?.refusalCategory;
         const canonicalGapEligible = !!canonicalCategory &&
           this.config.compressionClassifierGapCategories?.includes(canonicalCategory) === true &&
-          canonicalPhysical.every((attempt) => attempt.stopReason === 'refusal' && attempt.refusalCategory === canonicalCategory);
+          canonicalPhysical.every((attempt) =>
+            attempt.stopReason === 'refusal' &&
+            attempt.refusalCategory === canonicalCategory &&
+            attempt.requestHash === canonicalRequestHash,
+          );
         if (!fallbackResponse && this.config.compressionSplitFallback === true && splitEntry && !canonicalGapEligible) {
           const leafHash = sha256Json(chunk.messages.map((message) => message.id));
           const textOf = (m: { content: ContentBlock[] }): string =>
@@ -6746,8 +6775,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       withPos.push({ s, first: Math.min(first, last), last: Math.max(first, last) });
     }
     withPos.sort((a, b) => a.first - b.first);
+    const gapRanges = this.summaries
+      .filter((summary) => summary.classifierGap && !summary.mergedInto)
+      .flatMap((gap) => {
+        const first = messageOrder.get(gap.sourceRange.first);
+        const last = messageOrder.get(gap.sourceRange.last);
+        return first === undefined || last === undefined
+          ? []
+          : [{ first: Math.min(first, last), last: Math.max(first, last) }];
+      })
+      .sort((a, b) => a.first - b.first);
+    const holeCoveredByGaps = (first: number, last: number): boolean => {
+      if (first > last) return true;
+      let cursor = first;
+      for (const gap of gapRanges) {
+        if (gap.last < cursor) continue;
+        if (gap.first > cursor) return false;
+        cursor = Math.max(cursor, gap.last + 1);
+        if (cursor > last) return true;
+      }
+      return false;
+    };
 
-    // Split into strictly contiguous live runs. Deleted messages do not occupy
+    // Split into live runs. A hole represented by an active classifier-gap
+    // record is a documented unknown, not missing topology: ordinary memories
+    // on either side may consolidate while the gap remains separately visible.
+    // Deleted messages do not occupy
     // positions in `messageOrder`, so this still bridges true tombstones; it
     // refuses only holes containing another live representation.
     const runs: Array<typeof withPos> = [];
@@ -6755,9 +6808,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let runEnd = -Infinity;
     for (const x of withPos) {
       if (run.length > 0 && x.first !== runEnd + 1) {
-        runs.push(run);
-        run = [];
-        runEnd = -Infinity;
+        const documentedGap = x.first > runEnd + 1 &&
+          holeCoveredByGaps(runEnd + 1, x.first - 1);
+        if (!documentedGap) {
+          runs.push(run);
+          run = [];
+          runEnd = -Infinity;
+        }
       }
       run.push(x);
       runEnd = Math.max(runEnd, x.last);
@@ -6885,8 +6942,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sourceIds: string[],
     ctx: StrategyContext
   ): Promise<void> {
-    if (this.mergeCrossesClassifierGap(sourceIds)) return;
-
     const sourceBranch = this.requireLoadedBranch('executeMerge');
     if (!ctx.membrane) {
       throw new Error('No membrane instance for merge');
@@ -6900,6 +6955,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn('executeMerge: some source summaries not found, skipping');
       return;
     }
+    if (sources.some((source) => source.classifierGap)) {
+      console.warn('executeMerge: classifier gaps are contextual records, not autobiographical merge sources');
+      return;
+    }
+    const contextualGaps = this.classifierGapsWithinMergeSpan(sources);
 
     // A queued merge may become stale after another worker/earlier queue item
     // parents only SOME of its sources. Reparenting the whole list in that
@@ -6975,6 +7035,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     };
     for (const src of sources) collectLeaves(src);
+    for (const gap of contextualGaps) collectLeaves(gap);
 
     // Find the start of the merge range in the message store.
     const mergeFirstMsgId = sources[0].sourceRange.first;
@@ -7175,8 +7236,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sources: sourceIds,
       });
     }
-    for (const src of sources) {
-      if (refusalFallback) {
+    const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
+    const targetItems = [...sources, ...contextualGaps].sort((a, b) =>
+      (messagePosition.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER) -
+      (messagePosition.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER),
+    );
+    for (const src of targetItems) {
+      if (src.classifierGap) {
+        llmMessages.push({
+          participant: 'Context Manager',
+          content: this.classifierGapContent(src.classifierGap.category),
+        });
+      } else if (refusalFallback) {
         // Emit the source itself as a recall pair, whatever its level.
         llmMessages.push({
           participant: 'Context Manager',
@@ -7265,6 +7336,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
+    if (contextualGaps.length > 0) {
+      mergeInstructionText += '\n\nDocumented-gap discipline: one or more Context Manager classifier-gap records appear in this source range. They are explicit unknown spans, not autobiographical memories. Do not infer, reconstruct, or smooth over their missing content. Preserve that the record contains a provisional labeled gap.';
+    }
     if (mergeSourceOnly) {
       mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
     }
@@ -10997,7 +11071,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Returns a fresh array so callers can never mutate the stored entry.
    *
    * This is the MINT-SIDE answer: the mint/merge recall ladders and
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
    * refusal-curve expansion all build here. Carriers ride it byte-verbatim by
    * default or are omitted whole under `mintCarrierPolicy: 'strip'`; see the
    * two contrary measurements documented on that option. The live window
@@ -11007,6 +11080,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * delimiter is still applied once per answer, whichever surface asked.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
     return wrapRecallAnswerContent(
       this.mintAnswerProse(summary),
       summary,
@@ -11079,6 +11153,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (`recallPairCost`), so the plan and the emission agree about carriers.
    */
   protected liveWindowAnswerContent(summary: SummaryEntry): ContentBlock[] {
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
     return wrapRecallAnswerContent(
       this.liveWindowAnswerProse(summary),
       summary,
@@ -11098,7 +11173,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * last makes opener and closer survive every cap by construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
    * capped enveloped answer runs over the cap by its own tag text. That is
    * the same soft-cap overshoot the truncator already takes for granted — it
    * appends its `[truncated — original was N tokens]` marker AFTER spending
@@ -11108,6 +11182,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never an empty envelope, never a torn one.
    */
   protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
     const prose = this.liveWindowAnswerProse(summary);
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
@@ -11162,7 +11237,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
       if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
-      content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      content.push(...(s.classifierGap
+        ? this.classifierGapContent(s.classifierGap.category)
+        : wrapRecallAnswerContent(capped, s, this.config.recallEnvelope)));
       if (maxTokens > 0) {
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;

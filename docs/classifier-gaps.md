@@ -6,8 +6,10 @@ o gaps. Existing canonical requests and quarantine identities are unchanged.
 
 After the L1 attempt family is exhausted, one durable L1 coverage entry may be written only when every physical attempt in the exhausted identical-request group is a refusal with the same request hash and the same nonempty allowlisted category. Non-refusals,
 provider errors, successes, quarantine skips, and synthetic exhaustion outcomes
-do not qualify. The split-stitch rung is unchanged; synthetic split outcomes do
-not qualify for this feature.
+do not qualify. When the canonical physical-attempt group is already unanimous in
+an allowlisted category, the split-stitch rung is skipped: the canonical ledger is
+the evidence and no synthetic split receipt is invented. Non-allowlisted refusal
+categories still take the configured bounded split path.
 
 `SummaryEntry.classifierGap` records the category, original source hash and range,
 canonical and attempted request hashes, typed per-attempt refusal evidence, quarantine key, and provisional/revisitable
@@ -15,8 +17,17 @@ markers. `sourceIds` retains exact coverage. The source archive and refusal ledg
 remain intact. The stored content is fixed Context Manager text; provider refusal
 text and reasoning are never copied. Live and mint recall use Context Manager as
 the participant. A legacy combined recall selection containing a gap uses individual
-pairs to preserve attribution. Gaps cannot merge, block merges across their source
-ranges, and do not consume the speculative L1 cap. The exhausted refusal and alert history remains append-only, but accepting the authorized gap appends a `clear` event with reason `classifier-gap-authorized`; active quarantine debt and its repeating health alarm clear because the source range now has durable labeled coverage.
+pairs to preserve attribution. A gap is never an autobiographical merge source and
+does not consume the speculative L1 cap. Ordinary memories on either side may
+merge across a hole fully covered by active gap records. Every crossing merge
+receives those records in source order under Context Manager attribution plus an
+explicit instruction not to infer, reconstruct, or smooth the unknown span. The
+gap remains independently active after the neighbouring memories are parented, so
+higher merges and the live window continue to render the scar. An all-gap window
+never forms a merge. The exhausted refusal and alert history remains append-only,
+but accepting the authorized gap appends a `clear` event with reason
+`classifier-gap-authorized`; active quarantine debt and its repeating health alarm
+clear because the source range now has durable labeled coverage.
 
 ## Supersession is unresolved
 

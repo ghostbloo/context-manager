@@ -1246,11 +1246,6 @@ export type SummaryLevel = number;
  */
 export type LegacySummaryLevel = 1 | 2 | 3;
 
-/**
- * A summary entry in the hierarchical memory pyramid.
- * L1: compressed from raw message chunks.
- * L_{k>1}: merged from mergeThreshold L_{k-1}s.
- */
 export interface ClassifierGapMetadata {
   kind: 'classifier-gap';
   category: string;
@@ -1264,6 +1259,11 @@ export interface ClassifierGapMetadata {
   revisitable: true;
 }
 
+/**
+ * A summary entry in the hierarchical memory pyramid.
+ * L1: compressed from raw message chunks.
+ * L_{k>1}: merged from mergeThreshold L_{k-1}s.
+ */
 export interface SummaryEntry {
   /** CM-authored coverage record, never resident autobiographical prose. */
   classifierGap?: ClassifierGapMetadata;
