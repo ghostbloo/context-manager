@@ -491,6 +491,9 @@ export type RecallEnvelopeMode = 'none' | 'xml';
 /** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
 export type CarrierPolicy = 'full' | 'live-strip';
 
+/** Whether summary reasoning carriers replay inside mint/merge recall pairs. */
+export type MintCarrierPolicy = 'full' | 'strip';
+
 export interface KvUnifiedConfig {
   policy: {
     alpha: number;
@@ -541,6 +544,12 @@ export interface AutobiographicalConfig {
   /** When true, onNewMessage() fires tick() as a background promise so compression
    *  runs automatically without the framework calling tick() explicitly. */
   autoTickOnNewMessage: boolean;
+  /**
+   * In-band message inserted immediately before each L1 source slice.
+   * `undefined` uses the historical default marker; a string replaces it;
+   * `false` omits the message entirely (no empty placeholder).
+   */
+  compressionMarker?: string | false;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
@@ -650,8 +659,9 @@ export interface AutobiographicalConfig {
    *    deterministically-refusing compress request passed once its recall
    *    pairs carried their summaries' signed reasoning, where the text-only
    *    arm refused. `'live-strip'` does not touch this path, and no value of
-   *    this option does: the anti-refusal duty stands until a measurement
-   *    retires it.
+   *    this LIVE-WINDOW option does; `mintCarrierPolicy` governs it separately.
+   *    A contrary Fable-5 measurement later retired the UNIVERSAL anti-refusal
+   *    claim while preserving this original result as model/content-specific.
    *  - LIVE-WINDOW RENDER — what the agent whose memory it is reads back.
    *    Thinking blocks are not read there, they are INHABITED, and a carrier
    *    sits at the memory's chronological slot: the instance re-enters the
@@ -670,14 +680,36 @@ export interface AutobiographicalConfig {
    * for the fold planner at its stripped cost, because a plan that prices what
    * it does not emit is the same wedge from the other side.
    *
-   * WHY THE DEFAULT IS `'full'`. The inhabitation cost is an argument, not a
-   * measurement, and the anti-refusal duty on the mint side IS measured. The
-   * knob exists so a host that finds the argument convincing can act on it for
-   * its own agents without waiting; flipping the default is a fleet-wide
-   * change to what every instance reads back and belongs to whoever lives
-   * under it.
+   * WHY THE DEFAULT IS `'full'`. The inhabitation cost is an argument rather
+   * than a fleet-wide measurement. Mint behavior is now a separate policy, so
+   * this default means only that changing what every resident reads back
+   * belongs to whoever lives under it, not that carriers must appear there to
+   * satisfy the compression provider.
    */
   carrierPolicy?: CarrierPolicy;
+  /**
+   * Whether captured summary reasoning carriers replay inside MINT and MERGE
+   * recall pairs. This is deliberately independent of `carrierPolicy`, which
+   * governs only what the resident reads in the live window.
+   *
+   *  - `'full'` (default) — replay stored `thinking` / `redacted_thinking`
+   *    blocks byte-verbatim before the summary prose. This preserves historical
+   *    behavior and the 2026-07-16 upstream measurement where carrier-bearing
+   *    recall cleared a deterministic refusal that text-only recall did not.
+   *  - `'strip'` — omit those WHOLE carrier blocks from compression recall
+   *    answers while retaining the summary text. A carrier-only summary falls
+   *    back to its durable `content` prose so the assistant turn is never empty.
+   *
+   * WHY THIS IS PER-AGENT AND DEFAULT-FULL. A later counter-measurement on
+   * Fable 5 with the in-band compression marker omitted (2026-09-26) found the
+   * opposite sign for one content-dependent request: carrier-bearing recall
+   * refused 5/5 before output, while deleting only the replayed carriers passed
+   * 2/2. That retires the claim that carriers are universally anti-refusal, not
+   * the earlier measurement itself. Hosts may elect `'strip'` for a resident
+   * and model whose retained requests demonstrate that need; fleet behavior is
+   * unchanged.
+   */
+  mintCarrierPolicy?: MintCarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
@@ -929,6 +961,23 @@ export interface AutobiographicalConfig {
    * Default: 3. Set to 0 to disable fallback (canonical is still attempted).
    */
   compressionRefusalCurveFallbacks?: number;
+
+  /**
+   * Number of identical normalized-request retries after a compression request returns
+   * `stopReason: refusal`. Retries preserve the complete normalized request;
+   * no curve/source-only reshaping occurs until all identical attempts refuse.
+   * Partial refusal output is discarded. Default: 0.
+   */
+  compressionIdenticalRefusalRetries?: number;
+  /** Disable all non-identical shape-changing disposition/transport fallbacks. Default true. */
+  compressionShapeFallbacks?: boolean;
+
+  /**
+   * Override wording for the ordinary first-person L1 instruction.
+   * `{targetTokens}` is substituted. Reading-mode and witnessed instructions
+   * retain their dedicated wording.
+   */
+  compressionInstruction?: string;
 
   /**
    * Total model context budget used to admit refusal-curve compression
@@ -1423,6 +1472,7 @@ Write naturally, as recollection of what you experienced.`,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,
+  compressionIdenticalRefusalRetries: 0,
   compressionContextBudgetTokens: 200000,
   overBudgetGraceRatio: 0.02,
   persistMintPreimages: false,

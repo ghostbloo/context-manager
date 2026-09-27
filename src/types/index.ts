@@ -42,6 +42,7 @@ export type {
   CompressionQuarantineStatus,
   RecallEnvelopeMode,
   CarrierPolicy,
+  MintCarrierPolicy,
   SummaryLevel,
   SummaryEntry,
   PhaseType,

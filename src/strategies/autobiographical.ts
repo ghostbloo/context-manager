@@ -2539,6 +2539,74 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return typeof stopReason === 'string' ? stopReason : undefined;
   }
 
+  private normalizedIdenticalRefusalRetries(): number {
+    const configured = this.config.compressionIdenticalRefusalRetries ?? 0;
+    return Number.isSafeInteger(configured) ? Math.max(0, configured) : 0;
+  }
+
+  /**
+   * Retry only a provider `refusal`, with the identical normalized request.
+   * Refusal responses (including any partial text) never escape this method
+   * unless every allowed attempt refused. Each exercised retry group is logged
+   * attempt-by-attempt with one request hash and an explicit resolved/abandoned
+   * disposition. Other terminal outcomes and transport errors are never retried.
+   */
+  private async completeCompressionWithIdenticalRefusalRetries(
+    ctx: StrategyContext,
+    request: NormalizedRequest,
+    operation: string,
+  ): Promise<NormalizedResponse> {
+    const retries = this.normalizedIdenticalRefusalRetries();
+    if (retries === 0) {
+      return ctx.membrane!.complete(request, { formatter: this.nativeFormatter });
+    }
+    const maxAttempts = 1 + retries;
+    const requestHash = sha256Json(request);
+    const attempts: Array<Record<string, unknown>> = [];
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const response = await ctx.membrane!.complete(request, { formatter: this.nativeFormatter });
+      const stopReason = this.compressionResponseStopReason(response);
+      const refusal = stopReason === 'refusal';
+      const outputTokens = response && typeof response === 'object'
+        ? (response as { usage?: { outputTokens?: unknown } }).usage?.outputTokens
+        : undefined;
+      const responseContent = response && typeof response === 'object'
+        ? (response as { content?: unknown }).content
+        : undefined;
+      const partialTextChars = Array.isArray(responseContent)
+        ? responseContent.reduce((total: number, block: unknown) => {
+          if (!block || typeof block !== 'object') return total;
+          const candidate = block as { type?: unknown; text?: unknown };
+          return total + (candidate.type === 'text' && typeof candidate.text === 'string' ? candidate.text.length : 0);
+        }, 0)
+        : 0;
+      attempts.push({
+        attempt,
+        maxAttempts,
+        requestHash,
+        stopReason: stopReason ?? null,
+        refusalCategory: refusal ? this.refusalCategory(response) ?? null : null,
+        outputTokens: typeof outputTokens === 'number' ? outputTokens : null,
+        partialTextChars,
+        discarded: refusal,
+      });
+      if (!refusal || attempt === maxAttempts) {
+        if (attempts.some((entry) => entry.stopReason === 'refusal')) {
+          const groupOutcome = refusal ? 'abandoned' : 'resolved';
+          for (const metadata of attempts) {
+            logCompressionCall({
+              event: 'compression:identical-refusal-attempt',
+              operation,
+              metadata: { ...metadata, groupOutcome },
+            });
+          }
+        }
+        return response as NormalizedResponse;
+      }
+    }
+    throw new Error('unreachable identical-refusal retry loop');
+  }
+
   private compressionResponseInputTokens(response: unknown): number | undefined {
     if (!response || typeof response !== 'object') return undefined;
     const typed = response as {
@@ -5315,15 +5383,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
-      // Recall answers carry the summary's verbatim reasoning carriers
-      // (signed thinking) when captured — validated 2026-07-16 on a
-      // deterministically-refusing mythos compress request: text-only →
-      // reasoning_extraction refusal; with carriers → end_turn. Replaying
-      // the model's own text WITH its encrypted reasoning reads as its own
-      // history rather than harvested output, the same KV-honesty argument
-      // as declaring tools. Raw message thinking is still stripped at
-      // insertion (unvalidated: the API rejects thinking blocks whose turn
-      // shape was modified, and split/collapse rewrites raw turns).
+      // Mint recall carriers follow the per-agent `mintCarrierPolicy`. Full
+      // replay preserves the 2026-07-16 anti-refusal measurement; strip is an
+      // explicit counter-policy for the opposite Fable-5 measurement. Raw
+      // message thinking remains stripped at insertion.
       llmMessages.push({
         participant: agentParticipant,
         content: this.summaryAnswerContent(s),
@@ -5351,10 +5414,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Structural start of the exact source-only shape. Never recover this by
     // searching text: the target itself may quote the marker.
     const sourceOnlyStartIndex = llmMessages.length;
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: COMPRESSION_MARKER }],
-    });
+    const compressionMarker = this.config.compressionMarker;
+    if (compressionMarker !== false) {
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: compressionMarker ?? COMPRESSION_MARKER }],
+      });
+    }
 
     // ---- 5. Chunk messages raw ----
     for (const m of chunk.messages) {
@@ -5485,10 +5551,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
-      // NOTE (2026-07-16): thinking is stripped from RAW messages at their
-      // llmMessages insertion sites, not in the mintMessages sanitize — a
-      // blanket strip would also remove the recall-pair reasoning carriers,
-      // which must reach the API verbatim (see the recall-pair sites).
+      // Thinking is stripped from RAW messages at their insertion sites, not
+      // here: a blanket sanitize would also override the separate per-agent
+      // mint-carrier policy applied while recall pairs are constructed.
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
       // 5-minute cache window, where markers cost more than they save. Only
@@ -5699,15 +5764,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
         try {
-          response = await ctx.membrane!.complete(
-            attemptRequest,
-            { formatter: this.nativeFormatter },
+          response = await this.completeCompressionWithIdenticalRefusalRetries(
+            ctx, attemptRequest, `compress_l1:${curveLabel}`,
           );
         } catch (error) {
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
           // Retry this attempt once with text-only recall pairs, loudly.
-          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
+          if (this.config.compressionShapeFallbacks === false || !isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
             throw error;
           }
           console.error(
@@ -5720,9 +5784,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
-          response = await ctx.membrane!.complete(
-            acceptedRequest,
-            { formatter: this.nativeFormatter },
+          response = await this.completeCompressionWithIdenticalRefusalRetries(
+            ctx, acceptedRequest, `compress_l1:${curveLabel}:carrier-stripped`,
           );
         }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
@@ -5786,7 +5849,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // quarantines (lena 2026-08-06, L1 site — the merge site had already
       // grown this retry). One immediate canonical retry with the no-tools
       // line, before the curve plan burns its bounded attempts.
-      if (canonicalStopReason === 'tool_use') {
+      if (canonicalStopReason === 'tool_use' && this.config.compressionShapeFallbacks !== false) {
         console.warn(
           `[autobiographical] canonical L1 mint rejected on tool_use — retrying once with no-tools instruction`,
         );
@@ -6059,8 +6122,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return j;
           };
           const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
+            const marker = this.config.compressionMarker;
             const msgs = [
-              { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
+              ...(marker === false ? [] : [{ participant: 'Context Manager', content: [{ type: 'text', text: marker ?? COMPRESSION_MARKER }] as ContentBlock[] }]),
               ...subset.map((m) => ({ participant: m.participant, content: stripThinkingBlocks(m.content) })),
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
             ];
@@ -6266,7 +6330,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
       const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
-      if (!summaryText.trim() && !sourceOnlyFinalWon) {
+      if (!summaryText.trim() && !sourceOnlyFinalWon && this.config.compressionShapeFallbacks !== false) {
         console.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
@@ -6737,7 +6801,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.mergeQueue[0]?.sourceIds === sourceIds ? (this.mergeQueue[0]?.attempts ?? 0) : 0;
     const mergeAttemptLimit = Math.max(1, this.config.mergeAttemptLimit ?? 5);
     const mergeSourceOnly = this.config.compressionMergeSourceOnly === true ||
-      (this.config.compressionMergeSourceOnlyFallback === true &&
+      (this.config.compressionShapeFallbacks !== false &&
+        this.config.compressionMergeSourceOnlyFallback === true &&
         mergeAttempts >= mergeAttemptLimit - 1);
 
     // Build the merge prompt with one-level-deeper target expansion +
@@ -6893,7 +6958,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const configuredRecallBudget = mergeSourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
     const mergeRecallBudget = mergeSourceOnly ? 0 : Math.max(
       8_000,
-      Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
+      Math.round(configuredRecallBudget * 0.5 ** Math.min(
+        this.config.compressionShapeFallbacks === false ? 0 : mergeAttempts,
+        4,
+      )),
     );
     if (mergeRecallBudget < configuredRecallBudget) {
       console.warn(
@@ -6930,7 +6998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         participant: 'Context Manager',
         content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
       });
-      // Carriers ride merge recall pairs too — see the L1 site rationale.
+      // Merge recall pairs use the same per-agent mint-carrier policy.
       llmMessages.push({
         participant,
         content: this.summaryAnswerContent(s),
@@ -6969,6 +7037,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // fidelity loss only on the degraded retry, and the summaries shown are
     // the agent's own words, so nothing is falsified.
     const refusalFallback =
+      this.config.compressionShapeFallbacks !== false &&
       this.mergeQueue[0]?.sourceIds === sourceIds &&
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       (this.mergeQueue[0]?.hadRefusal === true ||
@@ -7014,7 +7083,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             participant: 'Context Manager',
             content: [{ type: 'text', text: `[CM] Recall memory ${child.id}.` }],
           });
-          // Carriers ride merge source expansions too — see the L1 site.
+          // Merge source expansions use the same mint-carrier policy.
           llmMessages.push({
             participant,
             content: this.summaryAnswerContent(child),
@@ -7089,6 +7158,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // sentence — and only on a retry after a tool_use rejection, keeping
     // first-attempt prompts byte-identical for KV/behavior stability.
     const retryAfterToolUse =
+      this.config.compressionShapeFallbacks !== false &&
       this.mergeQueue[0]?.sourceIds === sourceIds &&
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       this.mergeQueue[0]?.lastStopReason === 'tool_use';
@@ -7102,6 +7172,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // text was all <thinking> preamble fails identically on every bare
     // retry (Opus-3 wrap habit — see PLAIN_PROSE_RETRY_LINE). Ask plainly.
     const retryAfterEmpty =
+      this.config.compressionShapeFallbacks !== false &&
       this.mergeQueue[0]?.sourceIds === sourceIds &&
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       this.mergeQueue[0]?.lastOutcome === 'unusable_empty';
@@ -7173,10 +7244,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // preserve pixels — and membrane error-logs every exercised shed. All
       // other callers fail loudly instead (no silent transport mutation).
       shedOversizeImages: true,
-      // NOTE (2026-07-16): thinking is stripped from RAW messages at their
-      // llmMessages insertion sites, not in the mintMessages sanitize — a
-      // blanket strip would also remove the recall-pair reasoning carriers,
-      // which must reach the API verbatim (see the recall-pair sites).
+      // Thinking is stripped from RAW messages at their insertion sites, not
+      // here: a blanket sanitize would also override the separate per-agent
+      // mint-carrier policy applied while recall pairs are constructed.
       messages: mintMessages,
       // 1h TTL on the seam markers: steady-state mint cadence exceeds the
       // 5-minute cache window, where markers cost more than they save. Only
@@ -7232,11 +7302,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
       let acceptedRequest = dispatchRequest;
       try {
-        response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
+        response = await this.completeCompressionWithIdenticalRefusalRetries(
+          ctx, dispatchRequest, `merge_l${targetLevel}`,
+        );
       } catch (error) {
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
+        if (this.config.compressionShapeFallbacks === false || !isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -7247,7 +7319,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           metadata: { error: String(error).slice(0, 300) },
         });
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
-        response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+        response = await this.completeCompressionWithIdenticalRefusalRetries(
+          ctx, acceptedRequest, `merge_l${targetLevel}:carrier-stripped`,
+        );
       }
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
@@ -9540,6 +9614,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (custom) return custom.replace('{targetTokens}', String(targetTokens));
       return formatWitnessedInstruction(targetTokens);
     }
+    const custom = this.config.compressionInstruction;
+    if (custom) return custom.replace('{targetTokens}', String(targetTokens));
     return formatInstruction(targetTokens);
   }
 
@@ -10799,17 +10875,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Returns a fresh array so callers can never mutate the stored entry.
    *
-   * This is the MINT-SIDE answer, and carriers ride it unconditionally: the
-   * mint/merge recall ladders and refusal-curve expansion all build here, and
-   * the carriers' anti-refusal duty on that surface is measured (see
-   * `carrierPolicy`). The live window builds from the same prose through
+   * This is the MINT-SIDE answer: the mint/merge recall ladders and
+   * refusal-curve expansion all build here. Carriers ride it byte-verbatim by
+   * default or are omitted whole under `mintCarrierPolicy: 'strip'`; see the
+   * two contrary measurements documented on that option. The live window
+   * builds from the stored prose through
    * `liveWindowAnswerProse`, which is where `carrierPolicy` applies. Both
    * roads pass through `wrapRecallAnswerContent`, so the `recallEnvelope`
    * delimiter is still applied once per answer, whichever surface asked.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
     return wrapRecallAnswerContent(
-      this.summaryAnswerProse(summary),
+      this.mintAnswerProse(summary),
       summary,
       this.config.recallEnvelope,
     );
@@ -10826,6 +10903,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return [...summary.responseContent];
     }
     return [{ type: 'text', text: summary.content }];
+  }
+
+  /**
+   * The answer body for MINT/MERGE recall under `mintCarrierPolicy`. Whole
+   * signed carrier blocks are either replayed byte-verbatim or omitted; they
+   * are never edited. If stripping would leave no prose, fall back to the
+   * durable summary text so the provider never receives an empty assistant
+   * turn.
+   */
+  protected mintAnswerProse(summary: SummaryEntry): ContentBlock[] {
+    const prose = this.summaryAnswerProse(summary);
+    if (this.config.mintCarrierPolicy !== 'strip') return prose;
+    const stripped = stripThinkingBlocks(prose);
+    const carriesProse = stripped.some(
+      (block) => block.type === 'text' && block.text.trim().length > 0,
+    );
+    return carriesProse ? stripped : [{ type: 'text', text: summary.content }];
   }
 
   /**
