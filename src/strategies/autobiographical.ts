@@ -6109,7 +6109,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // error aborts the rung (errors never recurse into smaller calls). Bounded by a
         // per-chunk call cap and a sliding-window cap scoped to this strategy instance
         // (it resets when the process restarts; it is not a durable quota).
-        if (!fallbackResponse && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
+        // Direct source-only (compressionSourceOnly) has no separate source-only-final
+        // request: the canonical request already has that shape, so the rung may enter.
+        const splitEntry = sourceOnlyFallbackRequest !== undefined || this.config.compressionSourceOnly === true;
+        if (!fallbackResponse && this.config.compressionSplitFallback === true && splitEntry) {
           const leafHash = sha256Json(chunk.messages.map((message) => message.id));
           const textOf = (m: { content: ContentBlock[] }): string =>
             m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
@@ -6137,7 +6140,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               tools: ctx.tools,
             } as NormalizedRequest;
           };
-          type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
+          type SplitPart = { range: [number, number]; depth: number; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
+          const configuredDepth = this.config.compressionSplitMaxDepth;
+          const maxDepth = configuredDepth !== undefined && Number.isSafeInteger(configuredDepth) && configuredDepth >= 1 ? configuredDepth : undefined;
           const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
           const parts: SplitPart[] = [];
           let lastGood: NormalizedResponse | undefined;
@@ -6157,14 +6162,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.splitCallTimes = this.splitCallTimes.filter((t) => windowStart - t < WINDOW_MS);
           // `attempt=false` for the root range: the source-only-final rung has just refused the
           // whole chunk in exactly this shape, so the rung starts by splitting rather than repeating it.
-          const fold = async (a: number, b: number, attempt = true): Promise<boolean> => {
+          const fold = async (a: number, b: number, attempt = true, depth = 0): Promise<boolean> => {
             if (abortReason) return false;
             const subset = chunk.messages.slice(a, b + 1);
             if (attempt) {
             if (calls >= MAX_SPLIT_CALLS) { abortReason = 'chunk-call-cap'; return false; }
             if (this.splitCallTimes.length >= MAX_WINDOW_CALLS) { abortReason = 'window-call-cap'; return false; }
             const chars = subset.reduce((n, m) => n + textOf(m).length, 0);
-            const target = Math.max(100, Math.round(targetTokens * chars / chunkChars));
+            // Bounded mode keeps the directive byte-identical to the canonical request
+            // (only the source subdivides); legacy mode scales the target to the leaf.
+            const target = maxDepth !== undefined ? targetTokens : Math.max(100, Math.round(targetTokens * chars / chunkChars));
             const sub = buildSub(subset, target);
             const label = `split:${a}-${b}`;
             calls++;
@@ -6201,7 +6208,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               }
               const txt = textOf(assessment.response).trim();
               if (txt.length > 0) {
-                parts.push({ range: [a, b], kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: trace.requestHash, responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
+                parts.push({ range: [a, b], depth, kind: 'fold', tokens: assessment.response.usage?.outputTokens ?? Math.ceil(txt.length / 3), inputTokens: assessment.response.usage?.inputTokens ?? 0, requestHash: trace.requestHash, responseContentHash: sha256Json(assessment.response.content), contentHash: sha256Json(txt), text: txt });
                 return true;
               }
             } else {
@@ -6209,6 +6216,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (assessment.outcome === 'provider_error') { abortReason = 'provider-error'; return false; }
             }
             }
+            // Refused (or empty) at the depth floor: stop. No deeper split, no placeholder.
+            if (maxDepth !== undefined && depth >= maxDepth) { abortReason = 'depth-floor'; return false; }
             // Refused (or empty): split at a lawful boundary, never inside a tool round.
             if (b > a) {
               const midWish = Math.floor((a + b) / 2);
@@ -6216,19 +6225,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               for (let i = a; i < b; i = groupEnd(i) + 1) { const e = groupEnd(i); if (e < b) cuts.push(e); }
               if (cuts.length === 0) return false; // the whole range is one indivisible tool round
               const cut = cuts.reduce((best, c) => (Math.abs(c - midWish) < Math.abs(best - midWish) ? c : best), cuts[0]);
-              const left = await fold(a, cut);
+              const left = await fold(a, cut, true, depth + 1);
               if (!left) return false;
-              return fold(cut + 1, b);
+              return fold(cut + 1, b, true, depth + 1);
             }
             if (this.config.compressionSplitPlaceholder !== true) return false;
             const m = subset[0];
             // Structural author only: the store's participant field, never text that could be quoted or spoofed.
             const who = /^(user|assistant|system)$/i.test(m.participant) ? undefined : m.participant;
             const ph = `[Operator note — not the resident's words: one preserved message${who ? ` from ${who}` : ''} at this point (message id ${m.id}) was not summarized in this entry; its exact source remains in the record.]`;
-            parts.push({ range: [a, a], kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
+            parts.push({ range: [a, a], depth, kind: 'placeholder', tokens: Math.ceil(ph.length / 3), contentHash: sha256Json(ph), text: ph });
             return true;
           };
-          const complete = await fold(0, chunk.messages.length - 1, false);
+          const complete = await fold(0, chunk.messages.length - 1, false, 0);
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
             const stitchedText = parts.map((p) => p.text).join('\n\n');
@@ -6271,7 +6280,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.lastSplitDetails = synthetic.details;
             fallbackResponse = synthetic;
             response = synthetic;
-            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), calls, attempted, leaves: { successful: successfulLeaves, modelReported: modelReportedLeaves, models: [...leafModels] }, compositeHash, contentHash, parts: partsMeta, placeholders };
+            splitMeta = { by: 'compressionSplitFallback', at: new Date().toISOString(), ...(maxDepth !== undefined ? { maxDepth } : {}), calls, attempted, leaves: { successful: successfulLeaves, modelReported: modelReportedLeaves, models: [...leafModels] }, compositeHash, contentHash, parts: partsMeta, placeholders };
             stitchedFoldRequestHashes = parts.flatMap((p) => (p.kind === 'fold' && p.requestHash ? [p.requestHash] : []));
             successfulTrace = {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,

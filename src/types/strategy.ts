@@ -939,7 +939,10 @@ export interface AutobiographicalConfig {
    * expansions, source-only-final) is refused, fold the chunk in halves recursively
    * at message boundaries with the same instruction/model, source-only, and install
    * the stitched pieces as ONE L1 over the chunk (per-piece ranges/hashes recorded on
-   * the entry as `stitched`). Off by default.
+   * the entry as `stitched`). Off by default. Enters after the source-only-final
+   * rung when `compressionSourceOnlyFallback` is on, or directly after the canonical
+   * attempt when `compressionSourceOnly` is on (the canonical request is then already
+   * source-only shaped, so the rung begins by splitting it).
    */
   compressionSplitFallback?: boolean;
   /**
@@ -948,6 +951,16 @@ export interface AutobiographicalConfig {
    * the record). Without it, such a chunk falls through to quarantine. Off by default.
    */
   compressionSplitPlaceholder?: boolean;
+  /**
+   * Split-stitch depth floor (2026-09-27, Fabula crossing). Unset keeps the legacy
+   * recursion down to single messages. N >= 1 stops splitting at depth N: 1 = halves,
+   * 2 = halves then quarters. A piece still refused at the floor abandons the rung
+   * (quarantine path) with reason `depth-floor`; placeholders never apply below it.
+   * Each stitched part records its `depth`, and the entry records `maxDepth`.
+   * When set, leaves reuse the canonical directive byte-for-byte (the parent target
+   * tokens, not a size-scaled target), so only the source subdivision changes.
+   */
+  compressionSplitMaxDepth?: number;
   /** Split-stitch: max sub-calls per chunk (default 40). */
   compressionSplitMaxCallsPerChunk?: number;
   /** Split-stitch: max sub-calls per strategy instance per 10-minute sliding window (default 80).

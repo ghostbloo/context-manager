@@ -60,12 +60,16 @@ function managerContext(manager: ContextManager): StrategyContext {
   return (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext();
 }
 
-async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number; participant2?: string; spoof2?: string; preimages?: boolean } = {}) {
+async function build(membrane: unknown, opts: { split?: boolean; placeholder?: boolean; n?: number; toolRound?: boolean; windowCap?: number; participant2?: string; spoof2?: string; preimages?: boolean; maxDepth?: number; directSourceOnly?: boolean } = {}) {
   const strategy = new ProbeStrategy({
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
-    compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+    compressionRefusalCurveFallbacks: 0,
+    ...(opts.directSourceOnly
+      ? { compressionSourceOnly: true, compressionSourceOnlyFallback: false, compressionMarker: false, compressionShapeFallbacks: false, compressionIdenticalRefusalRetries: 2 }
+      : { compressionSourceOnlyFallback: true }),
     compressionSplitFallback: opts.split, compressionSplitPlaceholder: opts.placeholder,
+    ...(opts.maxDepth !== undefined ? { compressionSplitMaxDepth: opts.maxDepth } : {}),
     ...(opts.windowCap !== undefined ? { compressionSplitMaxCallsPer10Min: opts.windowCap } : {}),
     ...(opts.preimages ? { persistMintPreimages: true } : {}),
   } as never);
@@ -308,5 +312,55 @@ describe('split-stitch L1 fallback', () => {
     await none.strategy.run(none.target, managerContext(none.manager));
     assert.equal(none.strategy.details()!.model.actual, 'unknown');
     assert.equal(none.strategy.details()!.cache.hitRatio, 0, 'no cache accounting → zeros, consistent');
+  });
+
+  // ---- bounded depth + direct source-only entry (2026-09-27, Fabula crossing) ----
+
+  it('maxDepth 2 with direct source-only: pairs pass, so halves-then-quarters stitch four pieces at depth 2', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 3 }); // 4 and 3 refuse; 2 passes
+    const fx = await build(membrane, { split: true, n: 8, maxDepth: 2, directSourceOnly: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const entries = fx.strategy.entries();
+    assert.equal(entries.length, 1, 'one stitched L1 over the chunk');
+    const stitched = entries[0]!.stitched as { maxDepth: number; parts: Array<{ range: [number, number]; depth: number; kind: string }>; placeholders: unknown[] };
+    assert.equal(stitched.maxDepth, 2);
+    assert.equal(stitched.placeholders.length, 0);
+    assert.deepEqual(stitched.parts.map((p) => p.depth), [2, 2, 2, 2], 'every piece is a quarter');
+    assert.deepEqual(stitched.parts.map((p) => p.range), [[0, 1], [2, 3], [4, 5], [6, 7]]);
+    // leaves are source-only and marker-free: no recall, no marker, same directive shape
+    const leaf = calls.find((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 2)!;
+    assert.ok(!texts(leaf).some((t) => t.includes('You will soon form a new memory')), 'marker omitted per compressionMarker:false');
+    assert.ok(!texts(leaf).some((t) => /Recall memory/.test(t)), 'no recall pairs on leaves');
+    // directive bytes identical to the canonical whole-chunk request
+    const canonical = calls.find((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 8)!;
+    const directiveOf = (c: NormalizedRequest) => texts(c).at(-1);
+    for (const c of calls) assert.equal(directiveOf(c), directiveOf(canonical), 'leaf directive equals canonical directive');
+  });
+
+  it('maxDepth 2: a quarter that still refuses stops at the floor, installs nothing, never splits to eighths', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 }); // only single messages would pass
+    const fx = await build(membrane, { split: true, n: 8, maxDepth: 2, directSourceOnly: true, placeholder: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.strategy.entries().length, 0, 'nothing installed (quarantine path)');
+    const sizes = calls.map((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length);
+    assert.ok(!sizes.includes(1), 'no single-message (depth 3) request was sent');
+    assert.ok(sizes.includes(2), 'quarters were attempted');
+  });
+
+  it('direct source-only with split off: no sub-requests (legacy behaviour unchanged)', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: false, n: 4, directSourceOnly: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(fx.strategy.entries().length, 0);
+    assert.ok(calls.every((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 4), 'only whole-chunk attempts');
+  });
+
+  it('maxDepth unset keeps legacy recursion to single messages', async () => {
+    const { membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, n: 4 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const stitched = fx.strategy.entries()[0]!.stitched as { maxDepth?: number; parts: Array<{ depth: number }> };
+    assert.equal(stitched.maxDepth, undefined);
+    assert.deepEqual(stitched.parts.map((p) => p.depth), [2, 2, 2, 2]);
   });
 });
