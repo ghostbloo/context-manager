@@ -265,3 +265,63 @@ for (const [category, allowlisted] of [['cyber', true], ['reasoning_extraction',
   });
 }
 
+// ---- read-only accessor: durable gaps are the authority for resume reconciliation ----
+
+async function reopen(path: string, options: Partial<AutobiographicalConfig> = {}) {
+  const strategy = new Probe({
+    compressionModel: 'test-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0,
+    autoTickOnNewMessage: false, minChunkCharsForLLM: 0, mergeThreshold: 99,
+    compressionClassifierGapCategories: ['cyber'], quarantineAlarmIntervalMs: 0, ...options,
+  });
+  const manager = await ContextManager.open({ path, strategy, membrane: { complete: async () => { throw new Error('no calls on reopen'); } } as never });
+  return { strategy, manager };
+}
+
+it('getClassifierGaps: [] with no gap; after a gap, one durable copy with exact indices, stable across calls', async () => {
+  const none = await fixture({}, ['success']);
+  await none.strategy.run(none.target, context(none.manager));
+  assert.deepEqual(none.strategy.getClassifierGaps(context(none.manager).messageStore), []);
+
+  const f = await fixture();
+  await f.strategy.run(f.chunk(2, 4), context(f.manager));
+  const store = context(f.manager).messageStore;
+  const [gap, ...rest] = f.strategy.getClassifierGaps(store);
+  assert.equal(rest.length, 0);
+  assert.equal(gap!.level, 1);
+  assert.deepEqual(gap!.sourceIds, f.all.slice(2, 4).map((m) => m.id));
+  assert.equal(gap!.startIndex, 2);
+  assert.equal(gap!.endIndex, 3);
+  assert.equal(gap!.classifierGap.category, 'cyber');
+  assert.ok(gap!.classifierGap.canonicalRequestHash);
+  // copies: mutating the result never reaches internal or persisted state
+  gap!.sourceIds.push('tampered');
+  gap!.classifierGap.category = 'tampered';
+  const again = f.strategy.getClassifierGaps(store)[0]!;
+  assert.equal(again.classifierGap.category, 'cyber');
+  assert.equal(again.sourceIds.length, 2);
+  assert.equal(f.strategy.entries().find((s) => s.classifierGap)!.classifierGap!.category, 'cyber');
+});
+
+it('resume: a persisted gap survives reopen and is returned; a refusal with no persisted gap is not', async () => {
+  // gap persisted, process "dies" before any convergence receipt -> reopen sees it
+  const persisted = await fixture();
+  await persisted.strategy.run(persisted.target, context(persisted.manager));
+  const hash = persisted.strategy.getClassifierGaps()[0]!.classifierGap.canonicalRequestHash;
+  const path1 = paths.at(-1)!;
+  persisted.manager.close();
+  const r1 = await reopen(path1);
+  const afterReopen = r1.strategy.getClassifierGaps(context(r1.manager).messageStore);
+  assert.equal(afterReopen.length, 1);
+  assert.equal(afterReopen[0]!.classifierGap.canonicalRequestHash, hash);
+  r1.manager.close();
+
+  // same physical refusal group, but no gap was persisted (category not allowlisted at the time)
+  const unpersisted = await fixture({ compressionClassifierGapCategories: [] });
+  await unpersisted.strategy.run(unpersisted.target, context(unpersisted.manager));
+  const path2 = paths.at(-1)!;
+  unpersisted.manager.close();
+  const r2 = await reopen(path2);
+  assert.deepEqual(r2.strategy.getClassifierGaps(context(r2.manager).messageStore), [], 'no retroactive gap from refusal shape');
+  r2.manager.close();
+});
+

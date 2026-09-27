@@ -17,6 +17,7 @@ import type {
   CompressionQuarantineStatus,
   SummaryLevel,
   SummaryEntry,
+  ClassifierGapMetadata,
   ProtectedRange,
   PinLevelOptions,
   SearchQuery,
@@ -3263,6 +3264,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.redactStateItems(this.compressionRefusalQuarantineLedgerStateId, 0, length);
     if (!this.isCompressionBranchCurrent(source)) return;
     this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
+  }
+
+  /**
+   * Durably persisted typed classifier gaps, read from the summaries state (not
+   * the in-memory mirror), as copies in stored order. Read-only: no mutation,
+   * debt clearing, or supersession. `startIndex`/`endIndex` are positions of the
+   * gap's first/last source message in `messages.getAll()` when a message store
+   * is given (else in this strategy's chunk order), or -1 when unresolvable.
+   * Returns [] when there is no store or no gap.
+   */
+  getClassifierGaps(messages?: { getAll(): Array<{ id: string }> }): Array<{
+    id: string;
+    level: number;
+    sourceIds: string[];
+    startIndex: number;
+    endIndex: number;
+    classifierGap: ClassifierGapMetadata;
+  }> {
+    if (!this.store) return [];
+    const persisted = this.store.getStateJson(this.summariesStateId);
+    if (!Array.isArray(persisted)) return [];
+    const order = messages
+      ? messages.getAll().map((message) => message.id)
+      : this.chunks.flatMap((chunk) => chunk.messages.map((message) => message.id));
+    const position = new Map(order.map((id, index) => [id, index] as const));
+    return (persisted as SummaryEntry[])
+      .filter((entry) => entry && entry.classifierGap)
+      .map((entry) => ({
+        id: entry.id,
+        level: entry.level,
+        sourceIds: [...entry.sourceIds],
+        startIndex: position.get(entry.sourceRange.first) ?? -1,
+        endIndex: position.get(entry.sourceRange.last) ?? -1,
+        classifierGap: structuredClone(entry.classifierGap!),
+      }));
   }
 
   /**

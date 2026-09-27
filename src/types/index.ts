@@ -45,6 +45,7 @@ export type {
   MintCarrierPolicy,
   SummaryLevel,
   SummaryEntry,
+  ClassifierGapMetadata,
   PhaseType,
   KnowledgeConfig,
   KnowledgeOptions,
