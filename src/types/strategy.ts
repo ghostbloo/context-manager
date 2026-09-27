@@ -961,6 +961,10 @@ export interface AutobiographicalConfig {
    * tokens, not a size-scaled target), so only the source subdivision changes.
    */
   compressionSplitMaxDepth?: number;
+  /** Default off. Exact provider categories eligible for provisional L1 record gaps
+   * after refusal exhaustion. Empty/absent never creates a gap. */
+  compressionClassifierGapCategories?: readonly string[];
+
   /** Split-stitch: max sub-calls per chunk (default 40). */
   compressionSplitMaxCallsPerChunk?: number;
   /** Split-stitch: max sub-calls per strategy instance per 10-minute sliding window (default 80).
@@ -1247,7 +1251,22 @@ export type LegacySummaryLevel = 1 | 2 | 3;
  * L1: compressed from raw message chunks.
  * L_{k>1}: merged from mergeThreshold L_{k-1}s.
  */
+export interface ClassifierGapMetadata {
+  kind: 'classifier-gap';
+  category: string;
+  sourceHash: string;
+  sourceRange: { first: string; last: string };
+  canonicalRequestHash: string;
+  requestHashes: string[];
+  attempts: Array<{ requestHash: string; stopReason: 'refusal'; category: string }>;
+  quarantineKey: string;
+  provisional: true;
+  revisitable: true;
+}
+
 export interface SummaryEntry {
+  /** CM-authored coverage record, never resident autobiographical prose. */
+  classifierGap?: ClassifierGapMetadata;
   /** Unique ID (e.g., "L1-0", "L2-3") */
   id: string;
   /** Present when the entry was produced by the split-stitch rung (compressionSplitFallback). */

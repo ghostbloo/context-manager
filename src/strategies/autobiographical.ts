@@ -579,6 +579,7 @@ type CompressionQuarantineEvent =
   | (CompressionQuarantineEventBase & {
       kind: 'clear';
       targetClaimId: string;
+      reason?: string;
     })
   | (CompressionQuarantineEventBase & {
       kind: 'exhausted';
@@ -648,6 +649,12 @@ interface RecallCurveVariant {
   deterministicInputBoundTokens: number;
 }
 
+interface CompressionPhysicalAttemptEvidence {
+  requestHash: string;
+  stopReason?: string;
+  refusalCategory?: string;
+}
+
 interface CompressionAttemptTrace {
   curveLabel: string;
   recallIds: string[];
@@ -667,6 +674,7 @@ interface CompressionAttemptTrace {
   errorType?: string;
   admittedTokens?: number;
   budgetTokens?: number;
+  physicalAttempts?: CompressionPhysicalAttemptEvidence[];
 }
 
 function sha256Json(value: unknown): string {
@@ -1256,7 +1264,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Explicit operator escape hatch. A retry remains canonical-first; clearing
    * this state only permits the same as-of request family to be issued again.
    */
-  async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
+  async clearCompressionRefusalQuarantine(key?: string, reason?: string): Promise<void> {
     this.requireLoadedBranch('clearCompressionRefusalQuarantine');
     if (!this.store) return;
     const sourceBranch = this.captureCompressionBranch();
@@ -1283,6 +1291,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           kind: 'clear',
           key: target.key,
           targetClaimId: target.generationId,
+          ...(reason ? { reason } : {}),
           created: Date.now(),
         });
       }
@@ -2328,6 +2337,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }
 
+  /** Fixed operator text; never replay provider-authored refusal prose. */
+  private classifierGapContent(category: string): ContentBlock[] {
+    return [{
+      type: 'text',
+      text: `[Context Manager record: provisional classifier gap (classifier-refused: ${category}). Source retained for later review; no autobiographical memory was authored.]`,
+    }];
+  }
+
   /** Read the durable log as well as the local mirror for cross-instance L1 races. */
   private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
     const local = this.summaries.find(
@@ -2555,6 +2572,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ctx: StrategyContext,
     request: NormalizedRequest,
     operation: string,
+    observeAttempts?: (attempts: readonly CompressionPhysicalAttemptEvidence[]) => void,
   ): Promise<NormalizedResponse> {
     const retries = this.normalizedIdenticalRefusalRetries();
     if (retries === 0) {
@@ -2563,6 +2581,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxAttempts = 1 + retries;
     const requestHash = sha256Json(request);
     const attempts: Array<Record<string, unknown>> = [];
+    const physicalAttempts: CompressionPhysicalAttemptEvidence[] = [];
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const response = await ctx.membrane!.complete(request, { formatter: this.nativeFormatter });
       const stopReason = this.compressionResponseStopReason(response);
@@ -2580,17 +2599,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           return total + (candidate.type === 'text' && typeof candidate.text === 'string' ? candidate.text.length : 0);
         }, 0)
         : 0;
+      const refusalCategory = refusal ? this.refusalCategory(response) : undefined;
+      physicalAttempts.push({ requestHash, ...(stopReason ? { stopReason } : {}), ...(refusalCategory ? { refusalCategory } : {}) });
       attempts.push({
         attempt,
         maxAttempts,
         requestHash,
         stopReason: stopReason ?? null,
-        refusalCategory: refusal ? this.refusalCategory(response) ?? null : null,
+        refusalCategory: refusalCategory ?? null,
         outputTokens: typeof outputTokens === 'number' ? outputTokens : null,
         partialTextChars,
         discarded: refusal,
       });
       if (!refusal || attempt === maxAttempts) {
+        observeAttempts?.(physicalAttempts.map((item) => ({ ...item })));
         if (attempts.some((entry) => entry.stopReason === 'refusal')) {
           const groupOutcome = refusal ? 'abandoned' : 'resolved';
           for (const metadata of attempts) {
@@ -2917,7 +2939,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content: [{ type: 'text' as const, text: `[CM] Recall memory ${child.id}.` }],
         },
         {
-          participant: canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
+          participant: child.classifierGap ? 'Context Manager' : canonicalRequest.messages[pairIndexes[0]! + 1]!.participant,
           content: this.summaryAnswerContent(child),
         },
       ]);
@@ -3620,8 +3642,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * otherwise re-discover the same unmerged run and re-enqueue it forever.
    * The merge-quarantine klaxon owns visibility; this guard stays silent.
    */
+  /** Gaps are topology boundaries even for explicit or persisted merge requests. */
+  private mergeCrossesClassifierGap(sourceIds: string[]): boolean {
+    const gaps = this.summaries.filter(s => s.classifierGap);
+    if (gaps.length === 0) return false;
+    const sources = this.summaries.filter(s => sourceIds.includes(s.id));
+    if (sources.some(s => s.classifierGap)) return true;
+    const positions = new Map(this.chunks.flatMap(c => c.messages).map((m, i) => [m.id, i]));
+    const endpoints = sources.flatMap(s => [positions.get(s.sourceRange.first), positions.get(s.sourceRange.last)]);
+    // With gaps present, unresolved positions cannot establish a safe merge span.
+    if (endpoints.some(p => p === undefined)) return true;
+    const lo = Math.min(...endpoints as number[]), hi = Math.max(...endpoints as number[]);
+    return gaps.some(gap => {
+      const first = positions.get(gap.sourceRange.first), last = positions.get(gap.sourceRange.last);
+      return first === undefined || last === undefined || (first <= hi && last >= lo);
+    });
+  }
+
   protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
+    if (this.mergeCrossesClassifierGap(merge.sourceIds)) return;
     if (this.mergeQuarantine.has(sha256Json(merge.sourceIds))) return;
     this.mergeQueue.push(merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
@@ -3991,7 +4031,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const sources: SummaryEntry[] = [];
     for (const s of this.summaries) {
-      if (s.level !== sourceLevel) continue;
+      if (s.level !== sourceLevel || s.classifierGap) continue;
       if (getSummaryParentId(s)) continue;
       if (queuedAtLevel.has(s.id)) continue;
       if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
@@ -4121,7 +4161,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected isAtSpeculativeCap(): boolean {
     const cap = this.config.maxSpeculativeL1s;
     if (cap === undefined || cap < 0) return false;
-    const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto).length;
+    const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto && !s.classifierGap).length;
     return unmergedL1s > cap;
   }
 
@@ -5388,7 +5428,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // explicit counter-policy for the opposite Fable-5 measurement. Raw
       // message thinking remains stripped at insertion.
       llmMessages.push({
-        participant: agentParticipant,
+        participant: s.classifierGap ? 'Context Manager' : agentParticipant,
         content: this.summaryAnswerContent(s),
       });
     }
@@ -5763,9 +5803,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        let physicalAttempts: CompressionPhysicalAttemptEvidence[] = [];
         try {
           response = await this.completeCompressionWithIdenticalRefusalRetries(
             ctx, attemptRequest, `compress_l1:${curveLabel}`,
+            (observed) => { physicalAttempts = observed.map((item) => ({ ...item })); },
           );
         } catch (error) {
           // Degraded mode: the transport rejected the carrier blocks
@@ -5786,6 +5828,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           response = await this.completeCompressionWithIdenticalRefusalRetries(
             ctx, acceptedRequest, `compress_l1:${curveLabel}:carrier-stripped`,
+            (observed) => { physicalAttempts = observed.map((item) => ({ ...item })); },
           );
         }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
@@ -5795,6 +5838,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
         }
         const stopReason = this.compressionResponseStopReason(response);
+        if (physicalAttempts.length === 0) {
+          const refusalCategory = response && typeof response === 'object'
+            ? this.refusalCategory(response as NormalizedResponse)
+            : undefined;
+          physicalAttempts = [{
+            requestHash: sha256Json(acceptedRequest),
+            ...(stopReason ? { stopReason } : {}),
+            ...(refusalCategory ? { refusalCategory } : {}),
+          }];
+        }
         const trace: CompressionAttemptTrace = {
           curveLabel,
           recallIds,
@@ -5812,6 +5865,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             : undefined,
           latencyMs: Date.now() - started,
           persisted: false,
+          physicalAttempts,
         };
         attemptTraces.push(trace);
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
@@ -6293,6 +6347,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             outcomes.push({ curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) });
             console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
             logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } });
+
           }
         }
         if (!fallbackResponse) {
@@ -6302,6 +6357,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, outcomes);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          const finalAttempt = attemptTraces.at(-1);
+          const finalOutcome = outcomes.at(-1);
+          const physicalAttempts = attemptTraces.flatMap((attempt) => attempt.physicalAttempts ?? []);
+          const category = physicalAttempts[0]?.refusalCategory;
+          const identicalAllowlistedRefusals = !!category &&
+            this.config.compressionClassifierGapCategories?.includes(category) === true &&
+            physicalAttempts.length > 0 &&
+            physicalAttempts.every((attempt) =>
+              attempt.stopReason === 'refusal' &&
+              attempt.refusalCategory === category &&
+              attempt.requestHash === canonicalRequestHash,
+            );
+          if (finalAttempt?.stopReason === 'refusal' && finalOutcome?.stopReason === 'refusal' &&
+              finalOutcome.outcome === 'refusal' && identicalAllowlistedRefusals &&
+              !this.findExactL1(chunkIdKey)) {
+            const sourceIds = chunk.messages.map(message => message.id);
+            const sourceRange = { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! };
+            const gapContent = this.classifierGapContent(category);
+            const content = (gapContent[0] as { text: string }).text;
+            const gap: SummaryEntry = {
+              id: `L1-${this.nextSummaryIdCounter()}`, level: 1, sourceLevel: 0,
+              sourceIds, sourceRange, content, tokens: this.estimateTokens(gapContent),
+              created: Date.now(),
+              classifierGap: {
+                kind: 'classifier-gap', category, sourceHash: quarantineRecord.chunkSourceHash,
+                sourceRange: { ...sourceRange }, canonicalRequestHash,
+                requestHashes: physicalAttempts.map(attempt => attempt.requestHash),
+                attempts: physicalAttempts.map((attempt) => ({
+                  requestHash: attempt.requestHash,
+                  stopReason: 'refusal',
+                  category,
+                })),
+                quarantineKey: quarantineRecord.key, provisional: true, revisitable: true,
+              },
+            };
+            this.pushSummary(gap);
+            chunk.compressed = true;
+            chunk.summaryId = gap.id;
+            this.markChunkRecordCompressed(chunk.recordId, gap.id);
+            await this.clearCompressionRefusalQuarantine(
+              quarantineRecord.key,
+              'classifier-gap-authorized',
+            );
+          }
           logCompressionCall({
             event: 'compression:curve-exhausted',
             operation: 'compress_l1',
@@ -6604,6 +6703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
     for (const s of unmerged) {
+      if (s.classifierGap) continue;
       const first = messageOrder.get(s.sourceRange.first);
       const last = messageOrder.get(s.sourceRange.last);
       if (first === undefined || last === undefined) {
@@ -6693,7 +6793,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Check L1 → L2
     const unmergedL1 = this.summaries.filter(
-      s => s.level === 1 && !s.mergedInto && !queuedL1.has(s.id),
+      s => s.level === 1 && !s.classifierGap && !s.mergedInto && !queuedL1.has(s.id),
     );
     const l1Run = this.contiguousMergeCandidates(unmergedL1, threshold);
     if (l1Run) {
@@ -6754,7 +6854,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let level = 1; level <= maxLevel; level++) {
       const queued = queuedSources.get(level) ?? new Set();
       const unmerged = this.summaries.filter(
-        s => s.level === level && !getSummaryParentId(s) && !queued.has(s.id),
+        s => s.level === level && !s.classifierGap && !getSummaryParentId(s) && !queued.has(s.id),
       );
       const run = this.contiguousMergeCandidates(unmerged, threshold);
       if (run) {
@@ -6775,6 +6875,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sourceIds: string[],
     ctx: StrategyContext
   ): Promise<void> {
+    if (this.mergeCrossesClassifierGap(sourceIds)) return;
+
     const sourceBranch = this.requireLoadedBranch('executeMerge');
     if (!ctx.membrane) {
       throw new Error('No membrane instance for merge');
@@ -7009,7 +7111,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       // Merge recall pairs use the same per-agent mint-carrier policy.
       llmMessages.push({
-        participant,
+        participant: s.classifierGap ? 'Context Manager' : participant,
         content: this.summaryAnswerContent(s),
       });
     }
@@ -7071,7 +7173,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           content: [{ type: 'text', text: `[CM] Recall memory ${src.id}.` }],
         });
         llmMessages.push({
-          participant,
+          participant: src.classifierGap ? 'Context Manager' : participant,
           content: this.summaryAnswerContent(src),
         });
       } else if (src.sourceLevel === 0) {
@@ -7094,7 +7196,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           });
           // Merge source expansions use the same mint-carrier policy.
           llmMessages.push({
-            participant,
+            participant: child.classifierGap ? 'Context Manager' : participant,
             content: this.summaryAnswerContent(child),
           });
         }
@@ -8053,7 +8155,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               };
               const answerEntry: ContextEntry = {
                 index: entries.length + 1,
-                participant: summaryParticipant,
+                participant: ancestor.classifierGap ? 'Context Manager' : summaryParticipant,
                 content: this.summaryAnswerContentCapped(ancestor, msgCap),
                 sourceRelation: 'derived',
                 cacheLayoutKey: ancestor.id,
@@ -8166,7 +8268,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
-          participant: summaryParticipant,
+          participant: ancestor.classifierGap ? 'Context Manager' : summaryParticipant,
           content: this.summaryAnswerContentCapped(ancestor, msgCap),
           sourceRelation: 'derived',
           cacheLayoutKey: ancestor.id,
@@ -9385,7 +9487,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (selectedSummaries.length > 0 || middleRaw.length > 0) {
       const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
-      if (this.config.positionedRecallPairs !== false) {
+      if (this.config.positionedRecallPairs !== false || selectedSummaries.some(s => s.classifierGap)) {
         // Build a unified, chronologically-sorted item list.
         type Item =
           | { kind: 'summary'; position: number; summary: SummaryEntry }
@@ -9417,7 +9519,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             };
             const answerEntry: ContextEntry = {
               index: entries.length + 1,
-              participant: summaryParticipant,
+              participant: summary.classifierGap ? 'Context Manager' : summaryParticipant,
               content: this.summaryAnswerContentCapped(summary, msgCap),
               sourceRelation: 'derived',
             };
@@ -10885,6 +10987,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Returns a fresh array so callers can never mutate the stored entry.
    *
    * This is the MINT-SIDE answer: the mint/merge recall ladders and
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
    * refusal-curve expansion all build here. Carriers ride it byte-verbatim by
    * default or are omitted whole under `mintCarrierPolicy: 'strip'`; see the
    * two contrary measurements documented on that option. The live window
@@ -10956,6 +11059,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,
     );
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
     return carriesProse ? stripped : [{ type: 'text', text: summary.content }];
   }
 
@@ -10984,6 +11088,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * last makes opener and closer survive every cap by construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
+    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
    * capped enveloped answer runs over the cap by its own tag text. That is
    * the same soft-cap overshoot the truncator already takes for granted — it
    * appends its `[truncated — original was N tokens]` marker AFTER spending
