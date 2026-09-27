@@ -6166,7 +6166,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Direct source-only (compressionSourceOnly) has no separate source-only-final
         // request: the canonical request already has that shape, so the rung may enter.
         const splitEntry = sourceOnlyFallbackRequest !== undefined || this.config.compressionSourceOnly === true;
-        if (!fallbackResponse && this.config.compressionSplitFallback === true && splitEntry) {
+        // A unanimous, gap-allowlisted refusal of the canonical group goes straight to the
+        // typed-gap disposition: splitting cannot help a category that isn't about density,
+        // and split attempts would carry non-canonical hashes that disqualify the gap.
+        const canonicalPhysical = attemptTraces
+          .filter((trace) => trace.requestHash === canonicalRequestHash)
+          .flatMap((trace) => trace.physicalAttempts ?? []);
+        const canonicalCategory = canonicalPhysical[0]?.refusalCategory;
+        const canonicalGapEligible = !!canonicalCategory &&
+          this.config.compressionClassifierGapCategories?.includes(canonicalCategory) === true &&
+          canonicalPhysical.every((attempt) => attempt.stopReason === 'refusal' && attempt.refusalCategory === canonicalCategory);
+        if (!fallbackResponse && this.config.compressionSplitFallback === true && splitEntry && !canonicalGapEligible) {
           const leafHash = sha256Json(chunk.messages.map((message) => message.id));
           const textOf = (m: { content: ContentBlock[] }): string =>
             m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');

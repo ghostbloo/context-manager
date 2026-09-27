@@ -175,3 +175,27 @@ it('absent and empty option keep request and live context bytes identical', asyn
   const a = await absent.manager.compile(budget), b = await empty.manager.compile(budget);
   assert.equal(JSON.stringify(a.messages), JSON.stringify(b.messages));
 });
+
+for (const [category, allowlisted] of [['cyber', true], ['reasoning_extraction', false]] as const) {
+  it(`direct source-only + bounded split + gaps: ${category} (${allowlisted ? 'allowlisted' : 'not allowlisted'})`, async () => {
+    const f = await fixture({
+      compressionSourceOnly: true, compressionSourceOnlyFallback: false, compressionMarker: false,
+      compressionIdenticalRefusalRetries: 2, compressionSplitFallback: true, compressionSplitMaxDepth: 2,
+      compressionClassifierGapCategories: ['cyber'], maxSpeculativeL1s: 6,
+    }, [category]);
+    const whole = f.chunk(0, 6);
+    await f.strategy.run(whole, context(f.manager));
+    const canonicalSize = whole.messages.length;
+    const sizes = f.requests.map((r) => r.messages.flatMap((m) => m.content).filter((b) => b.type === 'text' && /^source \d+ /.test(b.text)).length);
+    const gaps = f.strategy.entries().filter((s) => s.classifierGap);
+    if (allowlisted) {
+      assert.deepEqual(sizes, [canonicalSize, canonicalSize, canonicalSize], 'exactly 3 canonical attempts, 0 split attempts');
+      assert.equal(gaps.length, 1, 'one typed gap');
+      assert.equal(gaps[0]!.classifierGap!.category, 'cyber');
+    } else {
+      assert.ok(sizes.some((n) => n < canonicalSize), 'bounded split still runs');
+      assert.equal(gaps.length, 0, 'no gap for a non-allowlisted category');
+    }
+  });
+}
+
