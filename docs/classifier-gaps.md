@@ -14,8 +14,11 @@ categories still take the configured bounded split path.
 `SummaryEntry.classifierGap` records the category, original source hash and range,
 canonical and attempted request hashes, typed per-attempt refusal evidence, quarantine key, and provisional/revisitable
 markers. `sourceIds` retains exact coverage. The source archive and refusal ledger
-remain intact. The stored content is fixed Context Manager text; provider refusal
-text and reasoning are never copied. Live and mint recall use Context Manager as
+remain intact. The stored content is fixed, neutral Context Manager text
+(`[Context Manager record: a span here is preserved unsummarized, pending review —
+receipt <id>.]`) with no refusal category or classifier vocabulary, since that text
+rides in later provider requests; the category lives only in `classifierGap`
+metadata and receipts. Provider refusal text and reasoning are never copied. Live and mint recall use Context Manager as
 the participant. A legacy combined recall selection containing a gap uses individual
 pairs to preserve attribution. A gap is never an autobiographical merge source and
 does not consume the speculative L1 cap. Ordinary memories on either side may

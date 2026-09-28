@@ -75,7 +75,9 @@ it('allowlisted exhausted refusal creates one durable gap with exact coverage an
   assert.ok(gap.classifierGap?.quarantineKey);
   assert.equal(gap.responseContent, undefined);
   assert.match(gap.content, /Context Manager record/);
-  assert.match(gap.content, /classifier-refused: cyber/);
+  assert.match(gap.content, /preserved unsummarized, pending review/);
+  assert.ok(gap.content.includes(`receipt ${gap.id}`), 'label names its receipt id');
+  assert.doesNotMatch(gap.content, /classifier|refus|cyber/i, 'no refusal vocabulary in the label');
   assert.doesNotMatch(gap.content, /Provider refusal/);
   assert.deepEqual(context(f.manager).messageStore.getAll(), before);
   assert.deepEqual(f.manager.getStore().getStateJson('default/autobio:summaries'), f.strategy.entries());
@@ -108,7 +110,7 @@ for (const [positionedRecallPairs, adaptiveResolution] of [[true, false], [false
     await f.strategy.run(f.target, context(f.manager));
     const live = await f.manager.compile({ maxTokens: adaptiveResolution ? 350 : 200_000, reserveForResponse: 0 });
     const assertRecord = (messages: NormalizedRequest['messages']) => {
-      const records = messages.filter(m => m.content.some(b => b.type === 'text' && b.text.includes('provisional classifier gap')));
+      const records = messages.filter(m => m.content.some(b => b.type === 'text' && b.text.includes('preserved unsummarized, pending review')));
       assert.ok(records.length > 0, 'gap is rendered');
       assert.ok(records.every(m => m.participant === 'Context Manager'));
       assert.ok(!messages.some(m => m.content.some(b => b.type === 'text' && b.text.includes('Provider refusal'))));
@@ -152,7 +154,7 @@ it('gap stays visible while ordinary neighbours merge across it without stalling
   await f.strategy.merge(2, [left.id, right.id], context(f.manager));
   const request = f.requests.at(-1)!;
   const renderedGap = request.messages.filter(message =>
-    message.content.some(block => block.type === 'text' && block.text.includes('classifier-refused: cyber')),
+    message.content.some(block => block.type === 'text' && block.text.includes(`receipt ${gap.id}`)),
   );
   assert.equal(renderedGap.length, 1, 'merge target carries one fixed gap record');
   assert.equal(renderedGap[0]!.participant, 'Context Manager');
@@ -171,7 +173,7 @@ it('gap stays visible while ordinary neighbours merge across it without stalling
 
   const live = await f.manager.compile({ maxTokens: 200_000, reserveForResponse: 0 });
   const liveGap = live.messages.filter(message =>
-    message.content.some(block => block.type === 'text' && block.text.includes('classifier-refused: cyber')),
+    message.content.some(block => block.type === 'text' && block.text.includes('preserved unsummarized, pending review')),
   );
   assert.ok(liveGap.length > 0, 'fixed gap record survives beside the merged parent');
   assert.ok(liveGap.every(message => message.participant === 'Context Manager'));

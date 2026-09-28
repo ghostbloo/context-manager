@@ -41,7 +41,52 @@ for (const mergeSourceOnly of [true, false]) for (const headWindowTokens of [0, 
     const mergeReq = requests.slice(before);
     assert.equal(mergeReq.length, 1, 'one merge request');
     const body = JSON.stringify(mergeReq[0]!.messages);
-    assert.ok(body.includes('classifier-refused: cyber'), 'gap record rendered');
+    assert.ok(body.includes('preserved unsummarized, pending review'), 'gap record rendered');
+    for (const word of ['classifier', 'refus', 'cyber', 'reasoning_extraction']) {
+      assert.ok(!body.toLowerCase().includes(word), `merge request carries no "${word}"`);
+    }
     assert.ok(!body.includes('GAPRAW'), 'refused raw source NOT re-sent in merge');
   });
 }
+
+it('API-facing gap text never carries refusal vocabulary; the category survives only in data', async () => {
+  const requests: NormalizedRequest[] = [];
+  const strategy = new Probe({ compressionModel: 'm', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 0, autoTickOnNewMessage: false,
+    minChunkCharsForLLM: 0, mergeThreshold: 99, compressionRefusalCurveFallbacks: 0, compressionShapeFallbacks: false, compressionSourceOnly: false,
+    compressionMarker: false, compressionClassifierGapCategories: ['cyber'], quarantineAlarmIntervalMs: 0, summaryParticipant: 'Resident' } as never);
+  const path = `./test-classifier-gap-merge-leak-${paths.length}`; paths.push(path);
+  const manager = await ContextManager.open({ path, strategy, membrane: { complete: async (r: NormalizedRequest) => {
+    requests.push(structuredClone(r));
+    const refused = JSON.stringify(r.messages).includes('GAPRAW') && !JSON.stringify(r.messages).includes('Consolidate');
+    return refused
+      ? { content: [], stopReason: 'refusal', usage: { inputTokens: 1, outputTokens: 0 }, raw: { response: { stop_details: { category: 'cyber' } } } }
+      : { content: [{ type: 'text', text: 'ok memory' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 5 }, raw: { response: {} } };
+  } } as never });
+  for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `${i >= 2 && i < 4 ? 'GAPRAW' : 'plain'} ${i} ` + 'detail '.repeat(30) }]);
+  const all = context(manager).messageStore.getAll();
+  const chunk = (s: number, e: number): Chunk => ({ index: s, startIndex: s, endIndex: e, messages: all.slice(s, e), tokens: 100, compressed: false });
+  strategy.setChunks([chunk(0, 2), chunk(2, 4), chunk(4, 6), chunk(6, 8)]);
+  for (const [s, e] of [[0, 2], [2, 4], [4, 6], [6, 8]] as const) await strategy.run(chunk(s, e), context(manager));
+  const gap = strategy.entries().find((x) => x.classifierGap)!;
+  assert.equal(gap.classifierGap!.category, 'cyber', 'category kept in metadata');
+  assert.equal(strategy.getClassifierGaps()[0]!.classifierGap.category, 'cyber', 'and via the accessor');
+  const firstAfterGap = requests.findIndex((r, i) => i > 0 && JSON.stringify(r.messages).includes('preserved unsummarized'));
+  assert.ok(firstAfterGap > 0, 'a later mint request recalls the gap record');
+  await strategy.merge(2, strategy.entries().filter((x) => x.level === 1 && !x.classifierGap).map((x) => x.id), context(manager));
+  const live = await manager.compile({ maxTokens: 200_000, reserveForResponse: 0 });
+  // Mint/merge requests: neutral record only, never the refused raw span.
+  for (const body of requests.slice(firstAfterGap).map((r) => JSON.stringify(r.messages))) {
+    assert.ok(body.includes(`receipt ${gap.id}`), 'neutral record with receipt id is visible');
+    for (const word of ['classifier', 'refus', 'cyber', 'reasoning_extraction', 'GAPRAW']) {
+      assert.ok(!body.toLowerCase().includes(word.toLowerCase()), `mint/merge text carries no "${word}"`);
+    }
+  }
+  // Live window: the record is neutral. (Raw source may legitimately render live when
+  // the budget admits it; the archive is the resident's own history.)
+  const liveBody = JSON.stringify(live.messages);
+  assert.ok(liveBody.includes(`receipt ${gap.id}`));
+  for (const word of ['classifier', 'refus', 'cyber', 'reasoning_extraction']) {
+    assert.ok(!liveBody.toLowerCase().includes(word), `live text carries no "${word}"`);
+  }
+});
+

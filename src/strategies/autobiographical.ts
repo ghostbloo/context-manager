@@ -2338,11 +2338,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }
 
-  /** Fixed operator text; never replay provider-authored refusal prose. */
-  private classifierGapContent(category: string): ContentBlock[] {
+  /**
+   * Fixed, provider-facing gap text. Deliberately neutral: no refusal category,
+   * no classifier vocabulary (that would ship the trigger's own words into every
+   * later request). The category lives only in `classifierGap` metadata and
+   * receipts; the id points there.
+   */
+  private classifierGapContent(summaryId: string): ContentBlock[] {
     return [{
       type: 'text',
-      text: `[Context Manager record: provisional classifier gap (classifier-refused: ${category}). Source retained for later review; no autobiographical memory was authored.]`,
+      text: `[Context Manager record: a span here is preserved unsummarized, pending review — receipt ${summaryId}.]`,
     }];
   }
 
@@ -6449,10 +6454,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               !this.findExactL1(chunkIdKey)) {
             const sourceIds = chunk.messages.map(message => message.id);
             const sourceRange = { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! };
-            const gapContent = this.classifierGapContent(category);
+            const gapId = `L1-${this.nextSummaryIdCounter()}`;
+            const gapContent = this.classifierGapContent(gapId);
             const content = (gapContent[0] as { text: string }).text;
             const gap: SummaryEntry = {
-              id: `L1-${this.nextSummaryIdCounter()}`, level: 1, sourceLevel: 0,
+              id: gapId, level: 1, sourceLevel: 0,
               sourceIds, sourceRange, content, tokens: this.estimateTokens(gapContent),
               created: Date.now(),
               classifierGap: {
@@ -7281,7 +7287,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (src.classifierGap) {
         llmMessages.push({
           participant: 'Context Manager',
-          content: this.classifierGapContent(src.classifierGap.category),
+          content: this.classifierGapContent(src.id),
         });
       } else if (refusalFallback) {
         // Emit the source itself as a recall pair, whatever its level.
@@ -7373,7 +7379,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
     );
     if (contextualGaps.length > 0) {
-      mergeInstructionText += '\n\nDocumented-gap discipline: one or more Context Manager classifier-gap records appear in this source range. They are explicit unknown spans, not autobiographical memories. Do not infer, reconstruct, or smooth over their missing content. Preserve that the record contains a provisional labeled gap.';
+      mergeInstructionText += '\n\nPreserved-span discipline: one or more Context Manager records in this source range mark spans preserved unsummarized, pending review. They are explicit unknown spans, not memories. Do not infer, reconstruct, or smooth over their missing content. Preserve that the record contains such a labeled span.';
     }
     if (mergeSourceOnly) {
       mergeInstructionText += '\n\nAttribution discipline: preserve who made each claim. Do not turn another participant’s diagnosis, promise, operational status, or forecast into your own first-person fact unless the source includes your own direct confirmation. Preserve corrections and uncertainty explicitly.';
@@ -11116,7 +11122,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * delimiter is still applied once per answer, whichever surface asked.
    */
   protected summaryAnswerContent(summary: SummaryEntry): ContentBlock[] {
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
+    if (summary.classifierGap) return this.classifierGapContent(summary.id);
     return wrapRecallAnswerContent(
       this.mintAnswerProse(summary),
       summary,
@@ -11179,7 +11185,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,
     );
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
+    if (summary.classifierGap) return this.classifierGapContent(summary.id);
     return carriesProse ? stripped : [{ type: 'text', text: summary.content }];
   }
 
@@ -11189,7 +11195,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (`recallPairCost`), so the plan and the emission agree about carriers.
    */
   protected liveWindowAnswerContent(summary: SummaryEntry): ContentBlock[] {
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
+    if (summary.classifierGap) return this.classifierGapContent(summary.id);
     return wrapRecallAnswerContent(
       this.liveWindowAnswerProse(summary),
       summary,
@@ -11218,7 +11224,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * never an empty envelope, never a torn one.
    */
   protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
-    if (summary.classifierGap) return this.classifierGapContent(summary.classifierGap.category);
+    if (summary.classifierGap) return this.classifierGapContent(summary.id);
     const prose = this.liveWindowAnswerProse(summary);
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
@@ -11274,7 +11280,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
       if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
       content.push(...(s.classifierGap
-        ? this.classifierGapContent(s.classifierGap.category)
+        ? this.classifierGapContent(s.id)
         : wrapRecallAnswerContent(capped, s, this.config.recallEnvelope)));
       if (maxTokens > 0) {
         remainingTokens -=
